@@ -205,6 +205,13 @@ unsigned long onboardSuccessMilli = 0;
 bool onboardRebootReady = false;
 unsigned long onboardRebootMilli = 0;
 bool wifiConnected = false;
+//Vars for runtime WiFi disconnect monitoring/recovery (main loop, after initial boot connect)
+bool wifiWasConnected = false;              //Tracks last-known WiFi state to detect drop/recovery transitions
+unsigned long wifiLostMilli = 0;            //millis() timestamp when WiFi was first seen disconnected
+bool wifiReconnectAttempted = false;        //Soft WiFi.reconnect() already tried for the current outage
+bool wifiReinitAttempted = false;           //Full WiFi.begin() re-init already tried for the current outage
+const unsigned long WIFI_RECONNECT_DELAY = 15000;   //ms disconnected before trying WiFi.reconnect()
+const unsigned long WIFI_REINIT_DELAY = 120000;     //ms disconnected before forcing a full WiFi.begin()
 //Vars for using AP Mode Only
 bool noWiFiMode = false;
 String manualAPName = deviceName + "_Hotspot";
@@ -334,6 +341,7 @@ String getDiscoveryConfig();
 void setupSoftAP();
 bool setupWifi();
 bool setupManualAP();
+void checkWifiConnection();
 bool setup_mqtt();
 void reconnect();
 bool reconnect_soft();
@@ -693,6 +701,13 @@ void loop() {
       }
       //Show/Refresh LED Strip
       FastLED.show();
+    }
+
+    // ===================
+    // WIFI CONNECTION MONITOR
+    // ===================
+    if (!noWiFiMode) {
+      checkWifiConnection();
     }
 
     // ===================
@@ -3378,6 +3393,9 @@ bool setupWifi() {
   //attempt connection
   //if successful, return true else false
   delay(200);
+  // Force STA-only mode - WiFi mode is persisted across reboots by the core, so without this
+  // the device can be left in a stale AP_STA coexistence mode left over from onboarding
+  WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.hostname(wifiHostName);
   WiFi.begin();
@@ -3427,9 +3445,70 @@ bool setupWifi() {
     Serial.print("IP Address: ");
     Serial.println(baseIP);
     Serial.println("Starting main setup...");
-  #endif    
+  #endif
   server.begin();
+  wifiWasConnected = true;
   return true;
+}
+
+//------------------------------------------------------------
+// Runtime WiFi Connection Monitor (non-blocking, called from loop)
+// The main sensor/LED loop runs independently of WiFi, so without this
+// a dropped STA connection is only ever handled by the core's implicit
+// auto-reconnect, which can get stuck (e.g. after a beacon timeout or a
+// failed DHCP renewal) and leave the device silently offline / off MQTT
+// even though it keeps working locally.
+//------------------------------------------------------------
+void checkWifiConnection() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      // Just recovered from an outage - refresh state that may now be stale
+      baseIP = WiFi.localIP().toString();
+      MDNS.end();
+      if (MDNS.begin(wifiHostName.c_str())) {
+        MDNS.addService("http", "tcp", 80);
+      }
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.print(F("WiFi reconnected. New IP: "));
+        Serial.println(baseIP);
+      #endif
+    }
+    wifiWasConnected = true;
+    wifiLostMilli = 0;
+    wifiReconnectAttempted = false;
+    wifiReinitAttempted = false;
+    return;
+  }
+
+  // WiFi is down
+  if (wifiWasConnected) {
+    // Just detected the drop
+    wifiWasConnected = false;
+    wifiLostMilli = millis();
+    wifiReconnectAttempted = false;
+    wifiReinitAttempted = false;
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println(F("WiFi connection lost."));
+    #endif
+    return;
+  }
+
+  unsigned long downFor = millis() - wifiLostMilli;
+  if (!wifiReconnectAttempted && (downFor > WIFI_RECONNECT_DELAY)) {
+    wifiReconnectAttempted = true;
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println(F("WiFi still down - attempting soft reconnect..."));
+    #endif
+    WiFi.reconnect();
+  } else if (!wifiReinitAttempted && (downFor > WIFI_REINIT_DELAY)) {
+    wifiReinitAttempted = true;
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println(F("WiFi still down - forcing full reconnect..."));
+    #endif
+    WiFi.disconnect();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPW.c_str());
+  }
 }
 
 bool setupManualAP() {
