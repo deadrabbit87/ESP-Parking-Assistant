@@ -206,12 +206,8 @@ bool onboardRebootReady = false;
 unsigned long onboardRebootMilli = 0;
 bool wifiConnected = false;
 //Vars for runtime WiFi disconnect monitoring/recovery (main loop, after initial boot connect)
-bool wifiWasConnected = false;              //Tracks last-known WiFi state to detect drop/recovery transitions
-unsigned long wifiLostMilli = 0;            //millis() timestamp when WiFi was first seen disconnected
-bool wifiReconnectAttempted = false;        //Soft WiFi.reconnect() already tried for the current outage
-bool wifiReinitAttempted = false;           //Full WiFi.begin() re-init already tried for the current outage
-const unsigned long WIFI_RECONNECT_DELAY = 15000;   //ms disconnected before trying WiFi.reconnect()
-const unsigned long WIFI_REINIT_DELAY = 120000;     //ms disconnected before forcing a full WiFi.begin()
+unsigned long wifiRetryMilli = 0;                   //millis() timestamp of the last WiFi.reconnect() attempt
+const unsigned long WIFI_RETRY_INTERVAL = 30000;    //ms between reconnect attempts while WiFi is down
 //Vars for using AP Mode Only
 bool noWiFiMode = false;
 String manualAPName = deviceName + "_Hotspot";
@@ -3447,7 +3443,6 @@ bool setupWifi() {
     Serial.println("Starting main setup...");
   #endif
   server.begin();
-  wifiWasConnected = true;
   return true;
 }
 
@@ -3461,53 +3456,28 @@ bool setupWifi() {
 //------------------------------------------------------------
 void checkWifiConnection() {
   if (WiFi.status() == WL_CONNECTED) {
-    if (!wifiWasConnected) {
-      // Just recovered from an outage - refresh state that may now be stale
+    if (baseIP != WiFi.localIP().toString()) {
+      // IP is new (either just reconnected or got a fresh DHCP lease) - refresh what may be stale
       baseIP = WiFi.localIP().toString();
       MDNS.end();
       if (MDNS.begin(wifiHostName.c_str())) {
         MDNS.addService("http", "tcp", 80);
       }
       #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-        Serial.print(F("WiFi reconnected. New IP: "));
+        Serial.print(F("WiFi (re)connected. IP: "));
         Serial.println(baseIP);
       #endif
     }
-    wifiWasConnected = true;
-    wifiLostMilli = 0;
-    wifiReconnectAttempted = false;
-    wifiReinitAttempted = false;
     return;
   }
 
-  // WiFi is down
-  if (wifiWasConnected) {
-    // Just detected the drop
-    wifiWasConnected = false;
-    wifiLostMilli = millis();
-    wifiReconnectAttempted = false;
-    wifiReinitAttempted = false;
+  // WiFi is down - retry every WIFI_RETRY_INTERVAL until it comes back
+  if (millis() - wifiRetryMilli > WIFI_RETRY_INTERVAL) {
+    wifiRetryMilli = millis();
     #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-      Serial.println(F("WiFi connection lost."));
-    #endif
-    return;
-  }
-
-  unsigned long downFor = millis() - wifiLostMilli;
-  if (!wifiReconnectAttempted && (downFor > WIFI_RECONNECT_DELAY)) {
-    wifiReconnectAttempted = true;
-    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-      Serial.println(F("WiFi still down - attempting soft reconnect..."));
+      Serial.println(F("WiFi down - attempting reconnect..."));
     #endif
     WiFi.reconnect();
-  } else if (!wifiReinitAttempted && (downFor > WIFI_REINIT_DELAY)) {
-    wifiReinitAttempted = true;
-    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-      Serial.println(F("WiFi still down - forcing full reconnect..."));
-    #endif
-    WiFi.disconnect();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID.c_str(), wifiPW.c_str());
   }
 }
 
